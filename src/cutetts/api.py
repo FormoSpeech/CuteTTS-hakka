@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import queue
 import random
@@ -73,30 +74,50 @@ class VoicePrompt:
     the VAE encoder and speaker encoder on it. ``reference_features`` are the
     VAE latents of the (cropped) reference, ``[frames, latent_dim]``;
     ``speaker_embedding`` is the speaker encoder output, ``[1, dim]``. Both
-    come from components shared by every CuteTTS checkpoint, so a prompt
-    built with one checkpoint works with the others.
+    come from components shared by every CuteTTS checkpoint.
+
+    ``reference_embeds`` caches the language model's embedding of the
+    reference (its local encoder output, ``[patches, hidden]``), the costliest
+    per-request step once the reference is encoded. It belongs to the model
+    that built it, identified by ``embeds_key``; a model with different local
+    encoder weights ignores it and embeds ``reference_features`` itself.
     """
 
     reference_features: torch.Tensor
     speaker_embedding: torch.Tensor
+    reference_embeds: torch.Tensor | None = None
+    embeds_key: str | None = None
 
     def save(self, path: str | Path) -> None:
         from safetensors.torch import save_file
 
+        tensors = {
+            "reference_features": self.reference_features,
+            "speaker_embedding": self.speaker_embedding,
+        }
+        metadata = None
+        if self.reference_embeds is not None and self.embeds_key is not None:
+            tensors["reference_embeds"] = self.reference_embeds
+            metadata = {"embeds_key": self.embeds_key}
         save_file(
-            {
-                "reference_features": self.reference_features.detach().cpu().contiguous(),
-                "speaker_embedding": self.speaker_embedding.detach().cpu().contiguous(),
-            },
+            {name: tensor.detach().cpu().contiguous() for name, tensor in tensors.items()},
             str(path),
+            metadata=metadata,
         )
 
     @classmethod
     def load(cls, path: str | Path) -> VoicePrompt:
-        from safetensors.torch import load_file
+        from safetensors import safe_open
 
-        tensors = load_file(str(path))
-        return cls(tensors["reference_features"], tensors["speaker_embedding"])
+        with safe_open(str(path), framework="pt") as handle:
+            tensors = {name: handle.get_tensor(name) for name in handle.keys()}
+            metadata = handle.metadata() or {}
+        return cls(
+            tensors["reference_features"],
+            tensors["speaker_embedding"],
+            tensors.get("reference_embeds"),
+            metadata.get("embeds_key"),
+        )
 
 
 @dataclass(frozen=True)
@@ -133,6 +154,7 @@ class CuteTTS:
     def __init__(self, runtime: RuntimeBundle, compile_lm: bool = False):
         self.runtime = runtime
         self.compile_lm = bool(compile_lm)
+        self._cached_embeds_key: str | None = None
 
     @classmethod
     def from_pretrained(
@@ -172,11 +194,12 @@ class CuteTTS:
             torch.cuda.manual_seed_all(seed)
 
     @staticmethod
-    def _prepare_branch(model, prefix, speaker_embedding):
+    def _prepare_branch(model, prefix, speaker_embedding, speech_embeds=None):
         prefix = prefix.to(model.device)
         embeds, _contains_speech, speech_features = model.prepare_input_embeds(
             prefix,
             lm_speaker_embedding=speaker_embedding,
+            speech_embeds=speech_embeds,
         )
         return embeds, speech_features
 
@@ -407,6 +430,7 @@ class CuteTTS:
         """Encode a reference recording once; pass the result as
         `reference_audio` to any generate method to skip re-encoding it."""
         processor = self.runtime.processor
+        model = self.runtime.model
         reference_wave, speaker_wave = prepare_reference_audio(
             reference_audio,
             self.runtime.sample_rate,
@@ -431,7 +455,42 @@ class CuteTTS:
                 speaker_wave.to(speaker_device),
                 int(self.runtime.speaker_encoder.sample_rate),
             )
-        return VoicePrompt(reference_features, speaker_output["embedding"].float())
+        manager = processor.segment_manager
+        segment = manager.fuse_segments([manager.create_speech_segment(reference_features[None, ...])])[0]
+        segment = segment.to(model.device)
+        embed_dtype = model.get_input_embeddings().weight.dtype
+        _, embeds = model.forward_speech_features(
+            segment.speech_tensor.to(embed_dtype), segment.speech_pad_mask
+        )
+        return VoicePrompt(
+            reference_features,
+            speaker_output["embedding"].float(),
+            embeds[segment.speech_pad_mask].to(embed_dtype),
+            self._embeds_key(),
+        )
+
+    def _embeds_key(self) -> str:
+        """Fingerprint of the weights that turn reference latents into LM
+        embeddings, so a VoicePrompt's cached embedding is reused only by a
+        model that would compute the same one."""
+        if self._cached_embeds_key is None:
+            model = self.runtime.model
+            digest = hashlib.sha256()
+            tensors = {
+                f"locenc.{name}": value for name, value in model.locenc.state_dict().items()
+            }
+            tensors |= {
+                f"locenc_to_lm_proj.{name}": value
+                for name, value in model.locenc_to_lm_proj.state_dict().items()
+            }
+            tensors["speech_scaling_factor"] = model.speech_scaling_factor
+            tensors["speech_bias_factor"] = model.speech_bias_factor
+            for name in sorted(tensors):
+                value = tensors[name].detach().cpu().contiguous()
+                digest.update(f"{name}:{value.dtype}:{tuple(value.shape)};".encode())
+                digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+            self._cached_embeds_key = digest.hexdigest()[:16]
+        return self._cached_embeds_key
 
     def _settings(
         self,
@@ -497,6 +556,7 @@ class CuteTTS:
         processor = self.runtime.processor
         model = self.runtime.model
         reference_features = None
+        reference_embeds = None
         speaker_embedding = None
         if mode == "voice_clone":
             prompt = (
@@ -506,6 +566,8 @@ class CuteTTS:
             )
             reference_features = prompt.reference_features.to(processor.device)
             speaker_embedding = prompt.speaker_embedding.to(model.device)
+            if prompt.reference_embeds is not None and prompt.embeds_key == self._embeds_key():
+                reference_embeds = prompt.reference_embeds.to(model.device)
 
         cond_prefix = build_prefix_segment(
             processor,
@@ -518,6 +580,7 @@ class CuteTTS:
             model,
             cond_prefix,
             lm_speaker_for_branch(plan.conditional, speaker_embedding),
+            reference_embeds,
         )
 
         uncond_embeds = None

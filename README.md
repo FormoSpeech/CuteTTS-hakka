@@ -49,7 +49,7 @@ results = model.generate_batch(
 
 `generate_batch_stream` takes the same arguments and yields `(index, AudioChunk)` as each text's audio is decoded.
 
-When the same voices are used over and over, encode each reference once with `create_voice_prompt` and pass the result as `reference_audio` to any generate method. This skips reading the file and running the VAE and speaker encoders on every request, and gives the same audio as passing the path. A `VoicePrompt` can be saved and reloaded:
+When the same voices are used over and over, encode each reference once with `create_voice_prompt` and pass the result as `reference_audio` to any generate method. This skips reading the file, running the VAE and speaker encoders, and embedding the reference into the language model on every request, and gives the same audio as passing the path. The cached language-model embedding is tied to the model's weights (the two Hakka checkpoints share them); a model with different weights ignores it and recomputes it from the stored VAE features. A `VoicePrompt` can be saved and reloaded:
 
 ```python
 from cutetts import VoicePrompt

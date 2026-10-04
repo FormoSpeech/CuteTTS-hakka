@@ -148,11 +148,17 @@ class CuteTTSModel(PreTrainedModel):
         self,
         batch: CuteTTSSegment,
         lm_speaker_embedding: Tensor | None = None,
+        speech_embeds: Tensor | None = None,
     ) -> tuple[Tensor, bool, Tensor | None]:
+        """`speech_embeds`, if given, are the already-embedded speech positions
+        ([positions, hidden], as `embed_acoustic_latents` would produce for
+        `batch.speech_tensor`); the returned speech features are then None."""
         input_embeds = self.get_input_embeddings()(batch.input_ids)
         contains_speech = batch.speech_tensor.size(1) != 0
         speech_features = None
-        if contains_speech:
+        if contains_speech and speech_embeds is not None:
+            input_embeds[batch.speech_mask] = speech_embeds.to(input_embeds.dtype)
+        elif contains_speech:
             speech_features, connected = self.forward_speech_features(
                 batch.speech_tensor.type_as(input_embeds),
                 batch.speech_pad_mask,
