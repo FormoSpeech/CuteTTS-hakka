@@ -35,7 +35,7 @@ python infer.py --model-dir formospeech/cutetts-hakka-community-1 --mode voice_c
     --reference-audio ref.wav --dialect 客語四縣腔 --text "客語語音合成測試。" --output out.wav
 ```
 
-For many utterances, `generate_batch` decodes them together. Batching keeps the GPU busy, and on one RTX A5000 the distilled model goes from 4.9x real time at batch 1 to 38x at batch 32.
+For many utterances, `generate_batch` decodes them together. Batching keeps the GPU busy, and on one RTX A5000 the distilled model goes from 5.2x real time at batch 1 to 37x at batch 32 (47x with precomputed voices, below).
 
 ```python
 results = model.generate_batch(
