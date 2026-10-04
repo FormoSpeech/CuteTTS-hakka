@@ -161,6 +161,7 @@ class CuteTTS:
         self._cached_embeds_key: str | None = None
         self._model_token = object()  # identifies this model in VoicePrompt._prefix_cache
         self._uncond_embeds: torch.Tensor | None = None
+        self._uncond_prefix_cache: dict = {}  # prefilled self._uncond_embeds, see naive_ar_infer
 
     @classmethod
     def from_pretrained(
@@ -273,6 +274,7 @@ class CuteTTS:
             cond_embeds,
             uncond_embeds,
             speaker_embedding=dit_speaker_for_plan(plan, speaker_embedding),
+            uncond_prefix_cache=self._uncond_prefix_cache,
             initial_previous_cond=initial_previous_from_prefix(
                 cond_speech,
                 plan.conditional.include_prompt,
@@ -362,6 +364,7 @@ class CuteTTS:
                     [b[0] for b in branches],
                     [b[2] for b in branches] if plan.uses_lm_cfg else None,
                     speaker_embedding=dit_speaker_for_plan(plan, speaker),
+                    uncond_prefix_cache=self._uncond_prefix_cache,
                 )
                 for row_latents in latents:
                     frames = row_latents.reshape(1, -1, row_latents.size(-1))
@@ -392,6 +395,7 @@ class CuteTTS:
                     [b[0] for b in branches],
                     [b[2] for b in branches] if plan.uses_lm_cfg else None,
                     speaker_embedding=dit_speaker_for_plan(plan, speaker),
+                    uncond_prefix_cache=self._uncond_prefix_cache,
                     on_patch=lambda step, latent, active: on_patch(step, latent, active, decoder=decoder),
                 )
             for row_pieces in pieces:

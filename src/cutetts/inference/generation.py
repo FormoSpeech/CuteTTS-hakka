@@ -122,6 +122,52 @@ def _new_static_lm_cache(
     return cached
 
 
+@dataclass(frozen=True)
+class PrefixSnapshot:
+    """A prefilled prefix: its per-layer keys/values and last hidden state.
+
+    A prefix that is the same for every request (the text-free
+    unconditional CFG branch) is prefilled once and copied into each new
+    cache instead of being run through the LM again."""
+
+    keys: tuple[torch.Tensor, ...]
+    values: tuple[torch.Tensor, ...]
+    last_hidden: torch.Tensor  # [1, hidden]
+    length: int
+
+
+def _cache_layer_kv(cache: Cache, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+    layers = getattr(cache, "layers", None)  # transformers >= 4.56
+    if layers is not None:
+        return layers[layer].keys, layers[layer].values
+    return cache.key_cache[layer], cache.value_cache[layer]
+
+
+def _snapshot_prefix(
+    lm: CuteTTSModel, cache: Cache, length: int, last_hidden: torch.Tensor
+) -> PrefixSnapshot:
+    layers = range(int(lm.qwen_backbone.config.num_hidden_layers))
+    kv = [_cache_layer_kv(cache, layer) for layer in layers]
+    return PrefixSnapshot(
+        keys=tuple(k[:, :, :length].clone() for k, _ in kv),
+        values=tuple(v[:, :, :length].clone() for _, v in kv),
+        last_hidden=last_hidden.clone(),
+        length=length,
+    )
+
+
+def _restore_prefix(cache: Cache, snapshot: PrefixSnapshot, batch: int = 1) -> None:
+    """Write a snapshot into an empty cache, repeated over `batch` rows."""
+    position = torch.arange(snapshot.length, device=snapshot.keys[0].device)
+    for layer, (keys, values) in enumerate(zip(snapshot.keys, snapshot.values)):
+        cache.update(
+            keys.expand(batch, -1, -1, -1).clone(),
+            values.expand(batch, -1, -1, -1).clone(),
+            layer,
+            {"cache_position": position},  # used by transformers < 4.56's StaticCache
+        )
+
+
 def _compiled_lm_decode_target(lm: CuteTTSModel):
     """Return one lazily compiled Qwen forward used only by decode steps.
 
@@ -803,6 +849,7 @@ def _naive_ar_infer_impl(
     vae_decoder=None,
     pcm_chunk_callback: Callable[[torch.Tensor], None] | None = None,
     stage_profiler: InferenceStageProfiler | None = None,
+    uncond_prefix_cache: "None|dict[str, PrefixSnapshot]" = None,
 ) -> NaiveInferResult:
     """Perform naive autoregressive inference for CuteTTS.
 
@@ -882,18 +929,32 @@ def _naive_ar_infer_impl(
         output_attentions=False
     )
 
+    last_hidden_uncond = None
     if _lm_cfg_enabled(config):
         _, Tprefix_uncond, _ = uncond_prefix_embeds.shape
         state.uncond_ar_position_ids[:] = Tprefix_uncond
         state.uncond_ar_position_ids = state.uncond_ar_position_ids.to(lm.device)
-        lm_outputs_uncond = lm.forward_lm(
-            inputs_embeds=uncond_prefix_embeds.to(lm.device),
-            attention_mask=None,
-            position_ids=torch.arange(Tprefix_uncond, device=lm.device).reshape(1, -1),
-            past_key_values=state.uncond_lm_kvc,
-            use_cache=True,
-            output_attentions=False
-        )
+        # Keyed by cache type: a static cache's prefill attends over its
+        # padded capacity, so its hidden state is kept separately.
+        snapshot_key = type(state.uncond_lm_kvc).__name__
+        snapshot = (uncond_prefix_cache or {}).get(snapshot_key)
+        if snapshot is not None and snapshot.length == Tprefix_uncond:
+            _restore_prefix(state.uncond_lm_kvc, snapshot)
+            last_hidden_uncond = snapshot.last_hidden
+        else:
+            lm_outputs_uncond = lm.forward_lm(
+                inputs_embeds=uncond_prefix_embeds.to(lm.device),
+                attention_mask=None,
+                position_ids=torch.arange(Tprefix_uncond, device=lm.device).reshape(1, -1),
+                past_key_values=state.uncond_lm_kvc,
+                use_cache=True,
+                output_attentions=False
+            )
+            last_hidden_uncond = lm_outputs_uncond.last_hidden_state[:, -1, :]
+            if uncond_prefix_cache is not None:
+                uncond_prefix_cache[snapshot_key] = _snapshot_prefix(
+                    lm, state.uncond_lm_kvc, Tprefix_uncond, last_hidden_uncond
+                )
     if use_multi_cfg:
         _, Tprefix_secondary, _ = secondary_uncond_prefix_embeds.shape
         state.secondary_uncond_ar_position_ids[:] = Tprefix_secondary
@@ -909,11 +970,6 @@ def _naive_ar_infer_impl(
     finish_stage(stage_profiler, "lm_prefill", prefill_started)
 
     last_hidden = lm_outputs.last_hidden_state[:, -1, :]
-    last_hidden_uncond = (
-        lm_outputs_uncond.last_hidden_state[:, -1, :]
-        if _lm_cfg_enabled(config)
-        else None
-    )
     last_hidden_secondary_uncond = (
         lm_outputs_secondary_uncond.last_hidden_state[:, -1, :]
         if use_multi_cfg
@@ -1138,8 +1194,13 @@ def naive_ar_infer(
     decode_each_patch: bool = False,
     pcm_chunk_callback: Callable[[torch.Tensor], None] | None = None,
     stage_profiler: InferenceStageProfiler | None = None,
+    uncond_prefix_cache: "None|dict[str, PrefixSnapshot]" = None,
 ) -> NaiveInferResult:
-    """Run ordinary AR inference with optional stateful per-patch VAE decode."""
+    """Run ordinary AR inference with optional stateful per-patch VAE decode.
+
+    uncond_prefix_cache: pass the same dict on every call only if
+    `uncond_prefix_embeds` is the same constant prefix each time; its
+    prefill is then done once and copied into later calls' caches."""
 
     common_kwargs = dict(
         secondary_uncond_prefix_embeds=secondary_uncond_prefix_embeds,
@@ -1153,6 +1214,7 @@ def naive_ar_infer(
         use_tqdm=use_tqdm,
         pcm_chunk_callback=pcm_chunk_callback,
         stage_profiler=stage_profiler,
+        uncond_prefix_cache=uncond_prefix_cache,
     )
     if not decode_each_patch:
         return _naive_ar_infer_impl(

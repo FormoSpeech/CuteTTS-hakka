@@ -41,6 +41,7 @@ from transformers.cache_utils import DynamicCache
 
 from cutetts.inference.generation import (
     NaiveInferConfig,
+    PrefixSnapshot,
     _acoustic_connector_dtype,
     _add_audio_dit_cond_input,
     _add_distilled_cfg_strength_input,
@@ -53,6 +54,8 @@ from cutetts.inference.generation import (
     _lm_cfg_enabled,
     _new_sampling_condition_cache,
     _require_offline_decode_compatible,
+    _restore_prefix,
+    _snapshot_prefix,
 )
 from cutetts.modeling.model import CuteTTSModel
 
@@ -71,6 +74,18 @@ def _left_pad(embeds: list[torch.Tensor], device: torch.device) -> tuple[torch.T
 
 class _Branch:
     """One LM branch (conditional or unconditional) for B rows."""
+
+    @classmethod
+    def from_snapshot(cls, lm: CuteTTSModel, snapshot: PrefixSnapshot, batch: int) -> _Branch:
+        """B rows that all start from the same prefilled prefix."""
+        branch = cls.__new__(cls)
+        branch.lm = lm
+        branch.mask = torch.ones((batch, snapshot.length), dtype=torch.long, device=lm.device)
+        branch.next_position = branch.mask.sum(-1, keepdim=True)
+        branch.cache = DynamicCache()
+        _restore_prefix(branch.cache, snapshot, batch)
+        branch.last_hidden = snapshot.last_hidden.expand(batch, -1)
+        return branch
 
     def __init__(self, lm: CuteTTSModel, prefixes: list[torch.Tensor]):
         self.lm = lm
@@ -111,6 +126,7 @@ def batched_ar_infer(
     uncond_prefix_embeds: list[torch.Tensor] | None,
     speaker_embedding: torch.Tensor | None = None,
     on_patch: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    uncond_prefix_cache: dict[str, PrefixSnapshot] | None = None,
 ) -> list[torch.Tensor]:
     """Decode B utterances together.
 
@@ -125,6 +141,9 @@ def batched_ar_infer(
             [B, patch, C], active [B] bool). Rows are active up to and
             including their final patch; streaming callers decode and emit
             only active rows.
+        uncond_prefix_cache: As in `naive_ar_infer`: only when every
+            unconditional prefix is the same constant one. It is then
+            prefilled once (as a single row) and copied into each batch.
 
     Returns:
         Per row, the generated latents in VAE scale, [N_i, patch, C].
@@ -138,7 +157,18 @@ def batched_ar_infer(
 
     batch = len(prefix_embeds)
     cond = _Branch(lm, prefix_embeds)
-    uncond = _Branch(lm, uncond_prefix_embeds) if use_lm_cfg else None
+    uncond = None
+    if use_lm_cfg and uncond_prefix_cache is not None:
+        snapshot = uncond_prefix_cache.get("DynamicCache")
+        if snapshot is None or snapshot.length != int(uncond_prefix_embeds[0].size(1)):
+            single = _Branch(lm, uncond_prefix_embeds[:1])
+            snapshot = _snapshot_prefix(
+                lm, single.cache, int(uncond_prefix_embeds[0].size(1)), single.last_hidden
+            )
+            uncond_prefix_cache["DynamicCache"] = snapshot
+        uncond = _Branch.from_snapshot(lm, snapshot, batch)
+    elif use_lm_cfg:
+        uncond = _Branch(lm, uncond_prefix_embeds)
 
     head_dtype = _head_condition_dtype(lm)
     connector_dtype = _acoustic_connector_dtype(lm)
