@@ -16,6 +16,8 @@ pip install git+https://github.com/FormoSpeech/CuteTTS-hakka.git
 hf auth login  # the Hakka checkpoints are gated: request access on the model page first
 ```
 
+The fork works with PyTorch >= 2.5.1 and transformers 4.51 through 5.x (upstream CuteTTS pins torch 2.5.1 and transformers 4.51.0). A plain install pulls the latest releases, whose default CUDA build needs a recent NVIDIA driver; with an older driver, install a matching PyTorch build first, e.g. `pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121`.
+
 ```python
 import soundfile as sf
 from cutetts import CuteTTS
