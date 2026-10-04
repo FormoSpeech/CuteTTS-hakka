@@ -1,5 +1,42 @@
 [EN](README.md) | [中文](README_zh.md)
 
+## FormoSpeech CuteTTS-hakka
+
+This is the [FormoSpeech](https://huggingface.co/formospeech) fork of CuteTTS with Taiwanese Hakka support. It runs the Hakka checkpoints below, which were finetuned with the target dialect named in the voice-clone instruction. Upstream CuteTTS cannot pass a dialect, so these checkpoints need this fork.
+
+| Model | Description |
+| --- | --- |
+| [formospeech/cutetts-hakka-community-1](https://huggingface.co/formospeech/cutetts-hakka-community-1) | Hakka finetune of CuteTTS. 10 flow-matching steps with classifier-free guidance. |
+| [formospeech/cutetts-hakka-community-1-distill](https://huggingface.co/formospeech/cutetts-hakka-community-1-distill) | Guidance-step distilled version. 4 single-branch steps, about 3.6x faster. |
+
+The fork adds a `dialect` argument to `CuteTTS.generate`, `CuteTTS.generate_stream` and the CLI (`--dialect`). It takes the same labels as [FormoSpeech/OmniVoice-hakka](https://github.com/FormoSpeech/OmniVoice-hakka): `客語四縣腔`, `客語海陸腔`, `客語大埔腔`, `客語饒平腔`, `客語詔安腔`, `客語南四縣腔`. `dialect` requires `mode="voice_clone"`. `from_pretrained` / `--model-dir` also accept a Hugging Face repo id.
+
+```bash
+pip install git+https://github.com/FormoSpeech/CuteTTS-hakka.git
+hf auth login  # the Hakka checkpoints are gated: request access on the model page first
+```
+
+```python
+import soundfile as sf
+from cutetts import CuteTTS
+
+model = CuteTTS.from_pretrained("formospeech/cutetts-hakka-community-1", device="cuda")
+result = model.generate(
+    "客語語音合成測試。",
+    mode="voice_clone",
+    reference_audio="ref.wav",
+    dialect="客語四縣腔",
+)
+sf.write("out.wav", result.waveform.squeeze(0).float().numpy(), result.sample_rate)
+```
+
+```bash
+python infer.py --model-dir formospeech/cutetts-hakka-community-1 --mode voice_clone \
+    --reference-audio ref.wav --dialect 客語四縣腔 --text "客語語音合成測試。" --output out.wav
+```
+
+Everything below is the upstream CuteTTS README.
+
 ## <sup><sup><sup><img src="assets/logo.png" alt="CuteTTS logo" height="72" align="middle"></sup></sup></sup> CuteTTS: Efficient and High-Quality Speech Synthesis via Autoregressive Modeling of Continuous Latents
 
 <a href="https://huggingface.co/OPPOer/CuteTTS"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HF%20Model-CuteTTS-yellow" alt="CuteTTS Hugging Face model"></a>

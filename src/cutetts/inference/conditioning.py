@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
+from cutetts.hakka import dialect_clause
 from cutetts.modeling.segments import CuteTTSSegment
 
 
@@ -67,6 +68,7 @@ def build_prefix_segment(
     *,
     target_text: str,
     reference_features: torch.Tensor | None = None,
+    dialect: str | None = None,
 ) -> CuteTTSSegment:
     manager = processor.segment_manager
     if plan.lm_uncond:
@@ -77,7 +79,9 @@ def build_prefix_segment(
         reference = manager.create_speech_segment(
             reference_features[None, ...]
         )
-        segments = processor._reference_prompt_segments(target_text, reference)
+        segments = processor._reference_prompt_segments(
+            target_text, reference, dialect_clause(dialect)
+        )
     else:
         segments = [
             manager.create_text_segment(

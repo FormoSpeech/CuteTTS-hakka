@@ -20,6 +20,9 @@ dependencies = [
   "numpy>=1.26,<3",
   "python-multipart>=0.0.18,<1",
   "safetensors>=0.4.5,<1",
+  # triton (torch.compile, used by the distilled sampler) imports setuptools,
+  # which uv and Python >= 3.12 venvs do not install.
+  "setuptools",
   "sentencepiece>=0.2,<1",
   "soundfile>=0.12,<1",
   "torch==2.5.1",

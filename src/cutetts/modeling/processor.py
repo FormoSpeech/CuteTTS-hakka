@@ -89,12 +89,13 @@ class CuteTTSProcessor(torch.nn.Module):
         self,
         target_text: str,
         reference_speech_segment: CuteTTSSegment,
+        dialect_clause: str = "",
     ) -> list[CuteTTSSegment]:
         manager = self.segment_manager
         prefix = manager.create_text_segment(
             self.tokenizer.encode(
-                "Transform the text into speech output, utilizing the distinct voice "
-                "of the provided speech sample.\nvoice reference:\n<|im_start|>"
+                f"Transform the text into speech output{dialect_clause}, utilizing the "
+                "distinct voice of the provided speech sample.\nvoice reference:\n<|im_start|>"
             )
         )
         suffix = manager.create_text_segment(

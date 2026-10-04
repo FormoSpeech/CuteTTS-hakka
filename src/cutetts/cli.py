@@ -22,14 +22,22 @@ from pathlib import Path
 import soundfile as sf
 
 from cutetts import CuteTTS
+from cutetts.hakka import HAKKA_DIALECTS
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate speech with CuteTTS.")
-    parser.add_argument("--model-dir", required=True)
+    parser.add_argument(
+        "--model-dir", required=True, help="Model directory or Hugging Face repo id."
+    )
     parser.add_argument("--text", required=True)
     parser.add_argument("--mode", choices=("tts", "voice_clone"), default="tts")
     parser.add_argument("--reference-audio")
+    parser.add_argument(
+        "--dialect",
+        choices=list(HAKKA_DIALECTS),
+        help="Taiwanese Hakka dialect (voice_clone with a FormoSpeech Hakka checkpoint)",
+    )
     parser.add_argument("--output", default="output.wav")
     parser.add_argument(
         "--device",
@@ -52,6 +60,7 @@ def main() -> None:
         args.text,
         mode=args.mode,
         reference_audio=args.reference_audio,
+        dialect=args.dialect,
         cfg_strength=args.cfg_strength,
         diffusion_steps=args.diffusion_steps,
         diffusion_sway_coefficient=args.diffusion_sway_coefficient,

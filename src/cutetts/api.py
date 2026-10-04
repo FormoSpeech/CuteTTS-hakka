@@ -34,6 +34,7 @@ from cutetts.inference.conditioning import (
     initial_previous_from_prefix,
     lm_speaker_for_branch,
 )
+from cutetts.hakka import dialect_clause
 from cutetts.inference.generation import NaiveInferConfig, naive_ar_infer
 from cutetts.modeling.sampling import set_sampler_compile_mode
 from cutetts.runtime import RuntimeBundle, load_runtime, prepare_reference_audio
@@ -68,6 +69,18 @@ class _StreamCancelled(Exception):
 _STREAM_DONE = object()
 
 
+def _resolve_model_dir(model_dir: str | Path) -> Path:
+    """A local model directory as is; otherwise a Hugging Face repo id
+    (e.g. "formospeech/cutetts-hakka-community-1"), downloaded once into the
+    Hub cache. Gated repos need a logged-in account with access."""
+    path = Path(model_dir).expanduser()
+    if path.exists() or str(model_dir).count("/") != 1:
+        return path
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(str(model_dir)))
+
+
 class CuteTTS:
     """Load one CuteTTS model directory and synthesize individual utterances."""
 
@@ -81,7 +94,7 @@ class CuteTTS:
         *,
         device: str | torch.device = "auto",
     ) -> "CuteTTS":
-        runtime = load_runtime(model_dir, device)
+        runtime = load_runtime(_resolve_model_dir(model_dir), device)
         set_sampler_compile_mode(
             "eager" if runtime.model.device.type == "mps" else "full-sampler"
         )
@@ -119,6 +132,7 @@ class CuteTTS:
         *,
         mode: str = "tts",
         reference_audio: str | Path | None = None,
+        dialect: str | None = None,
         cfg_strength: float = 2.0,
         diffusion_steps: int | None = None,
         diffusion_sway_coefficient: float | None = None,
@@ -134,6 +148,9 @@ class CuteTTS:
             raise ValueError("mode must be 'tts' or 'voice_clone'.")
         if mode == "voice_clone" and reference_audio is None:
             raise ValueError("voice_clone requires reference_audio.")
+        if dialect is not None and mode != "voice_clone":
+            raise ValueError("dialect is only supported with mode='voice_clone'.")
+        dialect_clause(dialect)  # validate before any work
         if not math.isfinite(cfg_strength) or cfg_strength < 0.0:
             raise ValueError("cfg_strength must be a finite non-negative number.")
         if max_decode_length <= 0:
@@ -194,6 +211,7 @@ class CuteTTS:
             plan.conditional,
             target_text=text,
             reference_features=reference_features,
+            dialect=dialect,
         )
         cond_embeds, cond_speech = self._prepare_branch(
             model,
@@ -258,6 +276,7 @@ class CuteTTS:
         *,
         mode: str = "tts",
         reference_audio: str | Path | None = None,
+        dialect: str | None = None,
         cfg_strength: float = 2.0,
         diffusion_steps: int | None = None,
         diffusion_sway_coefficient: float | None = None,
@@ -305,6 +324,7 @@ class CuteTTS:
                     text,
                     mode=mode,
                     reference_audio=reference_audio,
+                    dialect=dialect,
                     cfg_strength=cfg_strength,
                     diffusion_steps=diffusion_steps,
                     diffusion_sway_coefficient=diffusion_sway_coefficient,
