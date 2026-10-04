@@ -91,16 +91,23 @@ class CuteTTSProcessor(torch.nn.Module):
         reference_speech_segment: CuteTTSSegment,
         dialect_clause: str = "",
     ) -> list[CuteTTSSegment]:
+        return [
+            *self._reference_voice_segments(reference_speech_segment, dialect_clause),
+            self._reference_text_segment(target_text),
+        ]
+
+    def _reference_voice_segments(
+        self,
+        reference_speech_segment: CuteTTSSegment,
+        dialect_clause: str = "",
+    ) -> list[CuteTTSSegment]:
+        """The voice-clone prompt up to and including the reference speech:
+        everything that depends on the voice and dialect, not on the text."""
         manager = self.segment_manager
         prefix = manager.create_text_segment(
             self.tokenizer.encode(
                 f"Transform the text into speech output{dialect_clause}, utilizing the "
                 "distinct voice of the provided speech sample.\nvoice reference:\n<|im_start|>"
-            )
-        )
-        suffix = manager.create_text_segment(
-            self.tokenizer.encode(
-                f"<|im_end|>\ntext input:\n{target_text}\n{self.text_suffix_token}"
             )
         )
         return [
@@ -110,5 +117,12 @@ class CuteTTSProcessor(torch.nn.Module):
                 self.tokenizer.encode("<|im_end|>\n<|im_start|>")
             ),
             reference_speech_segment,
-            suffix,
         ]
+
+    def _reference_text_segment(self, target_text: str) -> CuteTTSSegment:
+        """The voice-clone prompt after the reference speech."""
+        return self.segment_manager.create_text_segment(
+            self.tokenizer.encode(
+                f"<|im_end|>\ntext input:\n{target_text}\n{self.text_suffix_token}"
+            )
+        )

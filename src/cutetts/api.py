@@ -22,7 +22,7 @@ import queue
 import random
 import threading
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -87,6 +87,10 @@ class VoicePrompt:
     speaker_embedding: torch.Tensor
     reference_embeds: torch.Tensor | None = None
     embeds_key: str | None = None
+    # Per (model, dialect): the embedded prompt up to and including the
+    # reference, which every request with this voice and dialect shares.
+    # Kept in memory only.
+    _prefix_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def save(self, path: str | Path) -> None:
         from safetensors.torch import save_file
@@ -155,6 +159,8 @@ class CuteTTS:
         self.runtime = runtime
         self.compile_lm = bool(compile_lm)
         self._cached_embeds_key: str | None = None
+        self._model_token = object()  # identifies this model in VoicePrompt._prefix_cache
+        self._uncond_embeds: torch.Tensor | None = None
 
     @classmethod
     def from_pretrained(
@@ -469,6 +475,33 @@ class CuteTTS:
             self._embeds_key(),
         )
 
+    def _voice_embeds(self, prompt: VoicePrompt, dialect: str | None, plan, speaker_embedding):
+        """Embedded voice-clone prompt up to and including the reference,
+        cached on the prompt for this model and dialect."""
+        key = (self._model_token, dialect)
+        embeds = prompt._prefix_cache.get(key)
+        if embeds is None:
+            processor = self.runtime.processor
+            model = self.runtime.model
+            manager = processor.segment_manager
+            reference = manager.create_speech_segment(
+                prompt.reference_features.to(processor.device)[None, ...]
+            )
+            segment = manager.fuse_segments(
+                processor._reference_voice_segments(reference, dialect_clause(dialect))
+            )[0]
+            reference_embeds = None
+            if prompt.reference_embeds is not None and prompt.embeds_key == self._embeds_key():
+                reference_embeds = prompt.reference_embeds.to(model.device)
+            embeds, _ = self._prepare_branch(
+                model,
+                segment,
+                lm_speaker_for_branch(plan.conditional, speaker_embedding),
+                reference_embeds,
+            )
+            prompt._prefix_cache[key] = embeds
+        return embeds
+
     def _embeds_key(self) -> str:
         """Fingerprint of the weights that turn reference latents into LM
         embeddings, so a VoicePrompt's cached embedding is reused only by a
@@ -555,8 +588,6 @@ class CuteTTS:
         (cond_embeds, cond_speech, uncond_embeds, initial_uncond, speaker)."""
         processor = self.runtime.processor
         model = self.runtime.model
-        reference_features = None
-        reference_embeds = None
         speaker_embedding = None
         if mode == "voice_clone":
             prompt = (
@@ -564,44 +595,37 @@ class CuteTTS:
                 if isinstance(reference_audio, VoicePrompt)
                 else self.create_voice_prompt(reference_audio)
             )
-            reference_features = prompt.reference_features.to(processor.device)
             speaker_embedding = prompt.speaker_embedding.to(model.device)
-            if prompt.reference_embeds is not None and prompt.embeds_key == self._embeds_key():
-                reference_embeds = prompt.reference_embeds.to(model.device)
-
-        cond_prefix = build_prefix_segment(
-            processor,
-            plan.conditional,
-            target_text=text,
-            reference_features=reference_features,
-            dialect=dialect,
-        )
-        cond_embeds, cond_speech = self._prepare_branch(
-            model,
-            cond_prefix,
-            lm_speaker_for_branch(plan.conditional, speaker_embedding),
-            reference_embeds,
-        )
+            # The voice part of the prompt is embedded once per voice and
+            # dialect; per request only the text part is tokenized and
+            # embedded. Embeddings are per position, so this matches
+            # embedding the whole prompt at once.
+            voice_embeds = self._voice_embeds(prompt, dialect, plan, speaker_embedding)
+            manager = processor.segment_manager
+            text_segment = manager.fuse_segments([processor._reference_text_segment(text)])[0]
+            total = voice_embeds.size(1) + text_segment.total_length
+            if total > manager.config.max_length:
+                raise ValueError(
+                    f"Inference prefix length {total} exceeds {manager.config.max_length}."
+                )
+            text_embeds = model.get_input_embeddings()(text_segment.input_ids.to(model.device))
+            cond_embeds = torch.cat([voice_embeds, text_embeds], dim=1)
+            cond_speech = None
+        else:
+            cond_prefix = build_prefix_segment(processor, plan.conditional, target_text=text)
+            cond_embeds, cond_speech = self._prepare_branch(model, cond_prefix, None)
 
         uncond_embeds = None
         initial_uncond = None
         if plan.uses_lm_cfg:
             assert plan.unconditional is not None
-            uncond_prefix = build_prefix_segment(
-                processor,
-                plan.unconditional,
-                target_text=text,
-                reference_features=reference_features,
-            )
-            uncond_embeds, uncond_speech = self._prepare_branch(
-                model,
-                uncond_prefix,
-                lm_speaker_for_branch(plan.unconditional, speaker_embedding),
-            )
-            initial_uncond = initial_previous_from_prefix(
-                uncond_speech,
-                plan.unconditional.include_prompt,
-            )
+            if not plan.unconditional.lm_uncond:
+                raise ValueError("Only the text-free unconditional branch is supported.")
+            # It holds no text, voice or speaker, so it is the same for every request.
+            if self._uncond_embeds is None:
+                uncond_prefix = build_prefix_segment(processor, plan.unconditional, target_text=text)
+                self._uncond_embeds, _ = self._prepare_branch(model, uncond_prefix, None)
+            uncond_embeds = self._uncond_embeds
 
         return cond_embeds, cond_speech, uncond_embeds, initial_uncond, speaker_embedding
 
