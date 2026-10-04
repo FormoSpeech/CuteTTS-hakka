@@ -169,13 +169,22 @@ class CuteTTS:
         *,
         device: str | torch.device = "auto",
         compile_lm: bool = False,
+        cuda_graph_decode: bool = True,
     ) -> "CuteTTS":
         """compile_lm: CUDA-graph the language model's decode step (static KV
         cache + torch.compile). Several times faster per generated patch, but
         the first generate() call pays a one-time compilation, so it suits
         long-running use (servers, batch synthesis) rather than one-shot CLI
-        calls. CUDA only."""
+        calls. CUDA only.
+
+        cuda_graph_decode: on CUDA, replay the streaming VAE decoder as a CUDA
+        graph, captured once per batch size. It computes the same audio and
+        cuts per-chunk decoding from ~8 ms to ~2 ms on an RTX A5000; turn it
+        off to save the graphs' GPU memory."""
         runtime = load_runtime(_resolve_model_dir(model_dir), device)
+        runtime.processor.acoustic_vae.cuda_graphs = bool(cuda_graph_decode) and (
+            runtime.processor.device.type == "cuda"
+        )
         set_sampler_compile_mode(
             "eager" if runtime.model.device.type == "mps" else "full-sampler"
         )

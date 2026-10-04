@@ -85,6 +85,12 @@ class AudioAcousticVAEAdapter(nn.Module):
         self.sample_rate = int(model.sample_rate)
         self.channels = int(getattr(model, "channels", 1))
         self._streaming_decoder_active = False
+        # When True, streaming decode on CUDA replays a CUDA graph per chunk
+        # shape (captured on first use, kept for later streams) instead of
+        # launching the decoder's kernels one by one.
+        self.cuda_graphs = False
+        self._decode_graphs: dict[tuple, tuple] = {}
+        self._decode_graph_pool = None
 
     def encode(self, audio: torch.Tensor, *args, **kwargs) -> AudioEncodeOutput:
         if audio.dim() == 2:
@@ -109,6 +115,7 @@ class AudioStreamingVAEDecoder:
         self._vae = vae
         self._states: dict[int, torch.Tensor] = {}
         self._originals: list[tuple[nn.Module, object]] = []
+        self._graph_key: tuple | None = None
 
     def __enter__(self) -> "AudioStreamingVAEDecoder":
         if self._originals:
@@ -135,38 +142,101 @@ class AudioStreamingVAEDecoder:
     def decode_chunk(self, latent_chunk: torch.Tensor) -> torch.Tensor:
         if not self._originals:
             raise RuntimeError("decode_chunk() must be called inside streaming_decode().")
+        if self._vae.cuda_graphs and latent_chunk.is_cuda and not torch.is_autocast_enabled("cuda"):
+            return self._graphed_decode(latent_chunk)
         return self._vae.decode(latent_chunk)
 
-    def _install(self) -> None:
+    def _graphed_decode(self, latent_chunk: torch.Tensor) -> torch.Tensor:
+        """Same computation as the patched eager decoder, with the causal
+        states held in fixed buffers updated in place so it can be replayed."""
+        key = (tuple(latent_chunk.shape), latent_chunk.dtype, latent_chunk.device)
+        with torch.inference_mode():
+            entry = self._vae._decode_graphs.get(key)
+            if entry is None:
+                entry = self._vae._decode_graphs[key] = self._capture(latent_chunk)
+            graph, static_input, static_output, states = entry
+            if self._graph_key is None:
+                for state in states.values():  # a new stream starts from silence
+                    state.zero_()
+                self._graph_key = key
+            elif self._graph_key != key:
+                raise RuntimeError("The chunk shape changed in the middle of a streaming decode.")
+            static_input.copy_(latent_chunk)
+            graph.replay()
+            return static_output.clone()
+
+    def _capture(self, latent_chunk: torch.Tensor) -> tuple:
+        states: dict[int, torch.Tensor] = {}
+        saved = []
+        for module, kind, context, trim in self._conv_specs():
+            saved.append((module, module.forward))
+            module.forward = self._static_state_forward(module, kind, context, trim, states)
+        try:
+            device = latent_chunk.device
+            static_input = latent_chunk.clone()
+            side = torch.cuda.Stream(device=device)
+            side.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(side):  # allocate the states and warm up kernels
+                for _ in range(2):
+                    self._vae.decode(static_input)
+            torch.cuda.current_stream(device).wait_stream(side)
+            if self._vae._decode_graph_pool is None:
+                self._vae._decode_graph_pool = torch.cuda.graph_pool_handle()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._vae._decode_graph_pool):
+                static_output = self._vae.decode(static_input)
+        finally:
+            for module, forward in saved:
+                module.forward = forward
+        return graph, static_input, static_output, states
+
+    @staticmethod
+    def _static_state_forward(module, kind, context, trim, states):
+        key = id(module)
+
+        def forward(x):
+            state = states.get(key)
+            if state is None:
+                state = states[key] = x.new_zeros(x.shape[0], x.shape[1], context)
+            full_input = torch.cat([state, x], dim=-1)
+            state.copy_(full_input[..., -context:])
+            if kind == "conv":
+                return nn.Conv1d.forward(module, full_input)
+            output = nn.ConvTranspose1d.forward(module, full_input)
+            left = context * int(module.stride[0])
+            return output[..., left:-trim] if trim > 0 else output[..., left:]
+
+        return forward
+
+    def _conv_specs(self) -> list[tuple[nn.Module, str, int, int]]:
+        """(module, "conv" | "transpose", context frames, output trim) for
+        every causal convolution that carries state across chunks."""
+        specs = []
         for module in self._vae.model.decoder.modules():
             causal_padding = getattr(module, "_CausalConv1d__padding", None)
             if isinstance(module, nn.Conv1d) and causal_padding is not None:
-                output_padding = int(
-                    getattr(module, "_CausalConv1d__output_padding", 0)
-                )
+                output_padding = int(getattr(module, "_CausalConv1d__output_padding", 0))
                 pad_size = int(causal_padding) * 2 - output_padding
                 if pad_size > 0:
-                    self._patch_causal_conv(module, pad_size)
+                    specs.append((module, "conv", pad_size, 0))
                 continue
-
-            transpose_padding = getattr(
-                module,
-                "_CausalTransposeConv1d__padding",
-                None,
-            )
-            if (
-                isinstance(module, nn.ConvTranspose1d)
-                and transpose_padding is not None
-            ):
+            transpose_padding = getattr(module, "_CausalTransposeConv1d__padding", None)
+            if isinstance(module, nn.ConvTranspose1d) and transpose_padding is not None:
                 output_padding = int(
                     getattr(module, "_CausalTransposeConv1d__output_padding", 0)
                 )
                 trim = int(transpose_padding) * 2 - output_padding
-                context_size = (int(module.kernel_size[0]) - 1) // int(
-                    module.stride[0]
-                )
+                context_size = (int(module.kernel_size[0]) - 1) // int(module.stride[0])
                 if context_size > 0:
-                    self._patch_transpose_conv(module, context_size, trim)
+                    specs.append((module, "transpose", context_size, trim))
+        return specs
+
+    def _install(self) -> None:
+        for module, kind, context, trim in self._conv_specs():
+            if kind == "conv":
+                self._patch_causal_conv(module, context)
+            else:
+                self._patch_transpose_conv(module, context, trim)
 
     def _patch_causal_conv(self, module: nn.Conv1d, pad_size: int) -> None:
         states = self._states

@@ -62,6 +62,8 @@ result = model.generate("客語語音合成測試。", mode="voice_clone", refer
 
 `CuteTTS.from_pretrained(..., compile_lm=True)` CUDA-graphs the language model's per-patch decode step, which makes single-utterance `generate` faster. The first call then pays a one-time compilation, so it suits long-running processes.
 
+On CUDA, the streaming VAE decoder that turns each patch into audio is replayed as a CUDA graph by default (`cuda_graph_decode=True`). It produces the same audio and cuts each chunk's decoding from about 8 ms to 2 ms, which shortens time to first audio. Each batch size captures its own graph the first time it is used.
+
 A model's `config.json` can set `generation_defaults` (e.g. `{"diffusion_sway_coefficient": 0.0}`). The Hakka base checkpoint uses it to default to uniform steps: on the Hakka eval they match sway sampling in quality, and the compiled sampler makes them about 2x faster.
 
 Everything below is the upstream CuteTTS README.
