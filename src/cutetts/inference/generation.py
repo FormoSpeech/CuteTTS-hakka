@@ -68,6 +68,10 @@ class NaiveInferConfig:
     batch_lm_cfg_decode: bool = False
     static_lm_cache: bool = False
     compile_lm_decode: bool = False
+    # Fixed static-cache capacity (prefix + decode steps it can hold). With
+    # one capacity for every utterance, a CUDA-graphed decode step is captured
+    # once per process instead of once per prefix length.
+    lm_cache_capacity: "int|None" = None
 
     def __post_init__(self):
         assert self.cfg_mode in {'nocfg', 'lm'}
@@ -118,18 +122,20 @@ def _new_static_lm_cache(
     return cached
 
 
-def _compiled_cpu_lm_decode_target(lm: CuteTTSModel):
-    """Return one lazily compiled Qwen forward used only by decode steps."""
-    if lm.device.type != "cpu":
-        raise ValueError("LM decode compilation is currently CPU-only.")
-    attribute = "_cutetts_compiled_cpu_lm_decode"
+def _compiled_lm_decode_target(lm: CuteTTSModel):
+    """Return one lazily compiled Qwen forward used only by decode steps.
+
+    CPU: dynamic-shape torch.compile. CUDA: mode="reduce-overhead" (CUDA
+    graphs) over a static KV cache, so a single-token decode step replays
+    one captured graph instead of launching every kernel from Python.
+    """
+    attribute = "_cutetts_compiled_lm_decode"
     target = getattr(lm, attribute, None)
     if target is None:
-        target = torch.compile(
-            lm.qwen_backbone.forward,
-            dynamic=True,
-            fullgraph=False,
-        )
+        if lm.device.type == "cuda":
+            target = torch.compile(lm.qwen_backbone, mode="reduce-overhead", dynamic=False)
+        else:
+            target = torch.compile(lm.qwen_backbone.forward, dynamic=True, fullgraph=False)
         # Avoid registering the optimized callable as a second nn.Module child.
         object.__setattr__(lm, attribute, target)
     return target
@@ -142,10 +148,21 @@ def _forward_lm_decode(
 ):
     if not config.compile_lm_decode:
         return lm.forward_lm(**kwargs)
-    return lm.forward_lm(
+    target = _compiled_lm_decode_target(lm)
+    kwargs.pop("output_attentions", None)
+    if lm.device.type != "cuda":
+        return target(**kwargs, return_dict=True)
+    if not isinstance(kwargs.get("past_key_values"), StaticCache):
+        raise ValueError("CUDA LM decode compilation needs static_lm_cache=True.")
+    torch.compiler.cudagraph_mark_step_begin()
+    outputs = target(
         **kwargs,
-        lm_model=_compiled_cpu_lm_decode_target(lm),
+        cache_position=kwargs["position_ids"].reshape(-1),
+        return_dict=True,
     )
+    # CUDA-graph outputs are overwritten by the next replay.
+    outputs.last_hidden_state = outputs.last_hidden_state.clone()
+    return outputs
 
 
 def _cfg_enabled(config: NaiveInferConfig) -> bool:
@@ -830,14 +847,17 @@ def _naive_ar_infer_impl(
     if config.static_lm_cache:
         state.lm_kvc = _new_static_lm_cache(
             lm,
-            Tprefix + config.max_decode_length,
+            max(Tprefix + config.max_decode_length, config.lm_cache_capacity or 0),
             "naive_conditional",
         )
         if _lm_cfg_enabled(config):
             assert uncond_prefix_embeds is not None
             state.uncond_lm_kvc = _new_static_lm_cache(
                 lm,
-                int(uncond_prefix_embeds.size(1)) + config.max_decode_length,
+                max(
+                    int(uncond_prefix_embeds.size(1)) + config.max_decode_length,
+                    config.lm_cache_capacity or 0,
+                ),
                 "naive_unconditional",
             )
         if use_multi_cfg:

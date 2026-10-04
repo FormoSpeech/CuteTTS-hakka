@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import math
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +41,9 @@ class RuntimeBundle:
     model: CuteTTSModel
     processor: CuteTTSProcessor
     speaker_encoder: FbankECAPAStudent
+    # Optional per-model generate() defaults from config.json
+    # ("generation_defaults"; absent from the upstream releases).
+    generation_defaults: dict = field(default_factory=dict)
 
 
 def _read_json(path: Path) -> dict:
@@ -147,6 +150,7 @@ def load_runtime(
         model=model,
         processor=processor,
         speaker_encoder=speaker_encoder,
+        generation_defaults=dict(config.get("generation_defaults", {})),
     )
 
 

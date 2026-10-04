@@ -35,7 +35,12 @@ from cutetts.inference.conditioning import (
     lm_speaker_for_branch,
 )
 from cutetts.hakka import dialect_clause
-from cutetts.inference.generation import NaiveInferConfig, naive_ar_infer
+from cutetts.inference.batch_generation import batched_ar_infer
+from cutetts.inference.generation import (
+    NaiveInferConfig,
+    _offline_decode_generated_latents,
+    naive_ar_infer,
+)
 from cutetts.modeling.sampling import set_sampler_compile_mode
 from cutetts.runtime import RuntimeBundle, load_runtime, prepare_reference_audio
 
@@ -67,6 +72,10 @@ class _StreamCancelled(Exception):
 
 
 _STREAM_DONE = object()
+# Static KV-cache capacity with compile_lm: prefix (instruction, reference
+# speech, text) plus max_decode_length must fit, or that utterance gets its
+# own larger cache and a one-off recompilation.
+LM_CACHE_CAPACITY = 2048
 
 
 def _resolve_model_dir(model_dir: str | Path) -> Path:
@@ -84,8 +93,9 @@ def _resolve_model_dir(model_dir: str | Path) -> Path:
 class CuteTTS:
     """Load one CuteTTS model directory and synthesize individual utterances."""
 
-    def __init__(self, runtime: RuntimeBundle):
+    def __init__(self, runtime: RuntimeBundle, compile_lm: bool = False):
         self.runtime = runtime
+        self.compile_lm = bool(compile_lm)
 
     @classmethod
     def from_pretrained(
@@ -93,12 +103,20 @@ class CuteTTS:
         model_dir: str | Path,
         *,
         device: str | torch.device = "auto",
+        compile_lm: bool = False,
     ) -> "CuteTTS":
+        """compile_lm: CUDA-graph the language model's decode step (static KV
+        cache + torch.compile). Several times faster per generated patch, but
+        the first generate() call pays a one-time compilation, so it suits
+        long-running use (servers, batch synthesis) rather than one-shot CLI
+        calls. CUDA only."""
         runtime = load_runtime(_resolve_model_dir(model_dir), device)
         set_sampler_compile_mode(
             "eager" if runtime.model.device.type == "mps" else "full-sampler"
         )
-        return cls(runtime)
+        if compile_lm and runtime.model.device.type != "cuda":
+            raise ValueError("compile_lm requires a CUDA device.")
+        return cls(runtime, compile_lm=compile_lm)
 
     @property
     def variant(self) -> str:
@@ -144,6 +162,142 @@ class CuteTTS:
         text = str(text).strip()
         if not text:
             raise ValueError("text must not be empty.")
+        steps, sway, cfg_mode, ordinary_cfg, distilled_cfg = self._settings(
+            mode,
+            reference_audio,
+            dialect,
+            cfg_strength,
+            diffusion_steps,
+            diffusion_sway_coefficient,
+            max_decode_length,
+        )
+
+        self._seed(int(seed))
+        processor = self.runtime.processor
+        model = self.runtime.model
+        plan = build_guidance_plan(mode, cfg_mode, ordinary_cfg)
+        cond_embeds, cond_speech, uncond_embeds, initial_uncond, speaker_embedding = (
+            self._branches(text, mode, reference_audio, dialect, plan)
+        )
+
+        infer_config = NaiveInferConfig(
+            diffusion_steps=steps,
+            cfg_strength=ordinary_cfg,
+            cfg_mode=cfg_mode,
+            max_decode_length=int(max_decode_length),
+            diffusion_sway_coefficient=sway,
+            distilled_cfg_strength=distilled_cfg,
+            static_lm_cache=self.compile_lm,
+            compile_lm_decode=self.compile_lm,
+            lm_cache_capacity=LM_CACHE_CAPACITY if self.compile_lm else None,
+        )
+        result = naive_ar_infer(
+            infer_config,
+            processor,
+            model,
+            cond_embeds,
+            uncond_embeds,
+            speaker_embedding=dit_speaker_for_plan(plan, speaker_embedding),
+            initial_previous_cond=initial_previous_from_prefix(
+                cond_speech,
+                plan.conditional.include_prompt,
+            ),
+            initial_uncond_previous_cond=initial_uncond,
+            separate_cfg_previous_cond=plan.uses_lm_cfg,
+            uncond_previous_cond_always_zero=plan.uncond_history_always_zero,
+            use_tqdm=bool(show_progress),
+            decode_each_patch=mode == "voice_clone" or pcm_chunk_callback is not None,
+            pcm_chunk_callback=pcm_chunk_callback,
+        )
+        return GenerationResult(
+            waveform=result.waveforms.detach().cpu(),
+            sample_rate=self.runtime.sample_rate,
+        )
+
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        texts: list[str],
+        *,
+        mode: str = "tts",
+        reference_audio: str | Path | list[str | Path] | None = None,
+        dialect: str | list[str | None] | None = None,
+        cfg_strength: float = 2.0,
+        diffusion_steps: int | None = None,
+        diffusion_sway_coefficient: float | None = None,
+        max_decode_length: int = 750,
+        seed: int = 42,
+        batch_size: int | None = None,
+    ) -> list[GenerationResult]:
+        """Synthesize several utterances, `batch_size` (default: all) at a time.
+
+        `reference_audio` and `dialect` take one value for every text or one
+        per text. Each batch decodes its rows together (see
+        cutetts.inference.batch_generation), so a row is a valid sample from
+        the model but not bit-identical to generate() on the same text and
+        seed. compile_lm does not apply to batched decoding.
+        """
+        texts = [str(text).strip() for text in texts]
+        if not texts or not all(texts):
+            raise ValueError("texts must be a non-empty list of non-empty strings.")
+        count = len(texts)
+        references = reference_audio if isinstance(reference_audio, list) else [reference_audio] * count
+        dialects = dialect if isinstance(dialect, list) else [dialect] * count
+        if len(references) != count or len(dialects) != count:
+            raise ValueError("reference_audio and dialect lists must match texts in length.")
+        settings = [
+            self._settings(
+                mode, ref, dia, cfg_strength, diffusion_steps,
+                diffusion_sway_coefficient, max_decode_length,
+            )
+            for ref, dia in zip(references, dialects)
+        ]
+        steps, sway, cfg_mode, ordinary_cfg, distilled_cfg = settings[0]
+        plan = build_guidance_plan(mode, cfg_mode, ordinary_cfg)
+        infer_config = NaiveInferConfig(
+            diffusion_steps=steps,
+            cfg_strength=ordinary_cfg,
+            cfg_mode=cfg_mode,
+            max_decode_length=int(max_decode_length),
+            diffusion_sway_coefficient=sway,
+            distilled_cfg_strength=distilled_cfg,
+        )
+        processor = self.runtime.processor
+        model = self.runtime.model
+        size = count if batch_size is None else max(1, int(batch_size))
+        self._seed(int(seed))
+        results: list[GenerationResult] = []
+        for start in range(0, count, size):
+            rows = range(start, min(start + size, count))
+            branches = [self._branches(texts[i], mode, references[i], dialects[i], plan) for i in rows]
+            speakers = [b[4] for b in branches]
+            speaker = None if speakers[0] is None else torch.cat(speakers, dim=0)
+            latents = batched_ar_infer(
+                infer_config,
+                model,
+                [b[0] for b in branches],
+                [b[2] for b in branches] if plan.uses_lm_cfg else None,
+                speaker_embedding=dit_speaker_for_plan(plan, speaker),
+            )
+            for row_latents in latents:
+                frames = row_latents.reshape(1, -1, row_latents.size(-1))
+                waveform = _offline_decode_generated_latents(processor, model, [frames])
+                results.append(
+                    GenerationResult(waveform=waveform.detach().cpu(), sample_rate=self.runtime.sample_rate)
+                )
+        return results
+
+    def _settings(
+        self,
+        mode: str,
+        reference_audio: str | Path | None,
+        dialect: str | None,
+        cfg_strength: float,
+        diffusion_steps: int | None,
+        diffusion_sway_coefficient: float | None,
+        max_decode_length: int,
+    ) -> tuple[int, float, str, float, float | None]:
+        """Validate the request; (steps, sway, cfg_mode, ordinary_cfg, distilled_cfg)."""
         if mode not in {"tts", "voice_clone"}:
             raise ValueError("mode must be 'tts' or 'voice_clone'.")
         if mode == "voice_clone" and reference_audio is None:
@@ -157,10 +311,11 @@ class CuteTTS:
             raise ValueError("max_decode_length must be positive.")
 
         if self.variant == "base":
-            steps = 10 if diffusion_steps is None else int(diffusion_steps)
-            sway = -0.8 if diffusion_sway_coefficient is None else float(
-                diffusion_sway_coefficient
-            )
+            defaults = self.runtime.generation_defaults
+            steps = int(defaults.get("diffusion_steps", 10)) if diffusion_steps is None else int(diffusion_steps)
+            sway = float(defaults.get("diffusion_sway_coefficient", -0.8)) if (
+                diffusion_sway_coefficient is None
+            ) else float(diffusion_sway_coefficient)
             if steps <= 0:
                 raise ValueError("diffusion_steps must be positive for CuteTTS.")
             if not -1.0 <= sway <= 2.0 / (math.pi - 2.0):
@@ -181,11 +336,20 @@ class CuteTTS:
             ordinary_cfg = 0.0
             distilled_cfg = cfg_strength
 
-        self._seed(int(seed))
+        return steps, sway, cfg_mode, ordinary_cfg, distilled_cfg
+
+    def _branches(
+        self,
+        text: str,
+        mode: str,
+        reference_audio: str | Path | None,
+        dialect: str | None,
+        plan,
+    ):
+        """One request's LM prefix embeddings and speaker embedding:
+        (cond_embeds, cond_speech, uncond_embeds, initial_uncond, speaker)."""
         processor = self.runtime.processor
         model = self.runtime.model
-        plan = build_guidance_plan(mode, cfg_mode, ordinary_cfg)
-
         reference_features = None
         speaker_embedding = None
         if mode == "voice_clone":
@@ -239,36 +403,7 @@ class CuteTTS:
                 plan.unconditional.include_prompt,
             )
 
-        infer_config = NaiveInferConfig(
-            diffusion_steps=steps,
-            cfg_strength=ordinary_cfg,
-            cfg_mode=cfg_mode,
-            max_decode_length=int(max_decode_length),
-            diffusion_sway_coefficient=sway,
-            distilled_cfg_strength=distilled_cfg,
-        )
-        result = naive_ar_infer(
-            infer_config,
-            processor,
-            model,
-            cond_embeds,
-            uncond_embeds,
-            speaker_embedding=dit_speaker_for_plan(plan, speaker_embedding),
-            initial_previous_cond=initial_previous_from_prefix(
-                cond_speech,
-                plan.conditional.include_prompt,
-            ),
-            initial_uncond_previous_cond=initial_uncond,
-            separate_cfg_previous_cond=plan.uses_lm_cfg,
-            uncond_previous_cond_always_zero=plan.uncond_history_always_zero,
-            use_tqdm=bool(show_progress),
-            decode_each_patch=mode == "voice_clone" or pcm_chunk_callback is not None,
-            pcm_chunk_callback=pcm_chunk_callback,
-        )
-        return GenerationResult(
-            waveform=result.waveforms.detach().cpu(),
-            sample_rate=self.runtime.sample_rate,
-        )
+        return cond_embeds, cond_speech, uncond_embeds, initial_uncond, speaker_embedding
 
     def generate_stream(
         self,

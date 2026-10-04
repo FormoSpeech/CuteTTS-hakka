@@ -35,6 +35,22 @@ python infer.py --model-dir formospeech/cutetts-hakka-community-1 --mode voice_c
     --reference-audio ref.wav --dialect 客語四縣腔 --text "客語語音合成測試。" --output out.wav
 ```
 
+For many utterances, `generate_batch` decodes them together. Batching keeps the GPU busy, and on one RTX A5000 the distilled model goes from 4.9x real time at batch 1 to 38x at batch 32.
+
+```python
+results = model.generate_batch(
+    ["第一句。", "第二句。"],
+    mode="voice_clone",
+    reference_audio=["ref1.wav", "ref2.wav"],  # one per text, or a single path for all
+    dialect="客語四縣腔",                       # likewise
+    batch_size=16,
+)
+```
+
+`CuteTTS.from_pretrained(..., compile_lm=True)` CUDA-graphs the language model's per-patch decode step, which makes single-utterance `generate` faster. The first call then pays a one-time compilation, so it suits long-running processes.
+
+A model's `config.json` can set `generation_defaults` (e.g. `{"diffusion_sway_coefficient": 0.0}`). The Hakka base checkpoint uses it to default to uniform steps: on the Hakka eval they match sway sampling in quality, and the compiled sampler makes them about 2x faster.
+
 Everything below is the upstream CuteTTS README.
 
 ## <sup><sup><sup><img src="assets/logo.png" alt="CuteTTS logo" height="72" align="middle"></sup></sup></sup> CuteTTS: Efficient and High-Quality Speech Synthesis via Autoregressive Modeling of Continuous Latents
