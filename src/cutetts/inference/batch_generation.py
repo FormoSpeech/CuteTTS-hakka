@@ -34,6 +34,8 @@ from the same model.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from transformers.cache_utils import DynamicCache
 
@@ -108,6 +110,7 @@ def batched_ar_infer(
     prefix_embeds: list[torch.Tensor],
     uncond_prefix_embeds: list[torch.Tensor] | None,
     speaker_embedding: torch.Tensor | None = None,
+    on_patch: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
 ) -> list[torch.Tensor]:
     """Decode B utterances together.
 
@@ -118,6 +121,10 @@ def batched_ar_infer(
         uncond_prefix_embeds: B unconditional prefixes for LM-level CFG.
         speaker_embedding: DiT speaker condition, [B, C] or, with CFG,
             [2B, C] laid out [conditional rows; unconditional rows].
+        on_patch: Called after every step with (step, latents in VAE scale
+            [B, patch, C], active [B] bool). Rows are active up to and
+            including their final patch; streaming callers decode and emit
+            only active rows.
 
     Returns:
         Per row, the generated latents in VAE scale, [N_i, patch, C].
@@ -168,6 +175,8 @@ def batched_ar_infer(
             hidden = torch.cat([hidden, uncond.last_hidden.to(dtype=head_dtype)], dim=0)
         pred = lm.head.sample(hidden, **head_input)
         latents.append(pred / lm.speech_scaling_factor - lm.speech_bias_factor)
+        if on_patch is not None:
+            on_patch(step, latents[-1], (finished_at < 0) | (finished_at >= step))
 
         if bool((finished_at >= 0).all()):
             break

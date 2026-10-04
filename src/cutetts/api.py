@@ -38,7 +38,9 @@ from cutetts.hakka import dialect_clause
 from cutetts.inference.batch_generation import batched_ar_infer
 from cutetts.inference.generation import (
     NaiveInferConfig,
+    _normalize_decoded_waveforms,
     _offline_decode_generated_latents,
+    _vae_decode_autocast,
     naive_ar_infer,
 )
 from cutetts.modeling.sampling import set_sampler_compile_mode
@@ -60,6 +62,41 @@ class AudioChunk:
 
     waveform: torch.Tensor
     sample_rate: int
+
+
+@dataclass(frozen=True)
+class VoicePrompt:
+    """A reference voice encoded once, for reuse across requests.
+
+    Build it with ``CuteTTS.create_voice_prompt`` and pass it as
+    ``reference_audio``; generation then skips decoding the file and running
+    the VAE encoder and speaker encoder on it. ``reference_features`` are the
+    VAE latents of the (cropped) reference, ``[frames, latent_dim]``;
+    ``speaker_embedding`` is the speaker encoder output, ``[1, dim]``. Both
+    come from components shared by every CuteTTS checkpoint, so a prompt
+    built with one checkpoint works with the others.
+    """
+
+    reference_features: torch.Tensor
+    speaker_embedding: torch.Tensor
+
+    def save(self, path: str | Path) -> None:
+        from safetensors.torch import save_file
+
+        save_file(
+            {
+                "reference_features": self.reference_features.detach().cpu().contiguous(),
+                "speaker_embedding": self.speaker_embedding.detach().cpu().contiguous(),
+            },
+            str(path),
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> VoicePrompt:
+        from safetensors.torch import load_file
+
+        tensors = load_file(str(path))
+        return cls(tensors["reference_features"], tensors["speaker_embedding"])
 
 
 @dataclass(frozen=True)
@@ -149,7 +186,7 @@ class CuteTTS:
         text: str,
         *,
         mode: str = "tts",
-        reference_audio: str | Path | None = None,
+        reference_audio: str | Path | VoicePrompt | None = None,
         dialect: str | None = None,
         cfg_strength: float = 2.0,
         diffusion_steps: int | None = None,
@@ -220,7 +257,7 @@ class CuteTTS:
         texts: list[str],
         *,
         mode: str = "tts",
-        reference_audio: str | Path | list[str | Path] | None = None,
+        reference_audio: str | Path | VoicePrompt | list[str | Path | VoicePrompt] | None = None,
         dialect: str | list[str | None] | None = None,
         cfg_strength: float = 2.0,
         diffusion_steps: int | None = None,
@@ -228,6 +265,7 @@ class CuteTTS:
         max_decode_length: int = 750,
         seed: int = 42,
         batch_size: int | None = None,
+        pcm_chunk_callback: Callable[[int, torch.Tensor], None] | None = None,
     ) -> list[GenerationResult]:
         """Synthesize several utterances, `batch_size` (default: all) at a time.
 
@@ -236,6 +274,13 @@ class CuteTTS:
         cutetts.inference.batch_generation), so a row is a valid sample from
         the model but not bit-identical to generate() on the same text and
         seed. compile_lm does not apply to batched decoding.
+
+        With `pcm_chunk_callback(index, chunk)`, audio is decoded patch by
+        patch with the streaming VAE decoder (one batched call per step) and
+        each text's [1, samples] chunks are passed on as they are decoded,
+        `index` being its position in `texts`. Without it, each text is
+        decoded once at the end, which is faster (per-step decoding cost
+        17-25% of throughput on an RTX A5000).
         """
         texts = [str(text).strip() for text in texts]
         if not texts or not all(texts):
@@ -272,25 +317,126 @@ class CuteTTS:
             branches = [self._branches(texts[i], mode, references[i], dialects[i], plan) for i in rows]
             speakers = [b[4] for b in branches]
             speaker = None if speakers[0] is None else torch.cat(speakers, dim=0)
-            latents = batched_ar_infer(
-                infer_config,
-                model,
-                [b[0] for b in branches],
-                [b[2] for b in branches] if plan.uses_lm_cfg else None,
-                speaker_embedding=dit_speaker_for_plan(plan, speaker),
-            )
-            for row_latents in latents:
-                frames = row_latents.reshape(1, -1, row_latents.size(-1))
-                waveform = _offline_decode_generated_latents(processor, model, [frames])
+            if pcm_chunk_callback is None:
+                latents = batched_ar_infer(
+                    infer_config,
+                    model,
+                    [b[0] for b in branches],
+                    [b[2] for b in branches] if plan.uses_lm_cfg else None,
+                    speaker_embedding=dit_speaker_for_plan(plan, speaker),
+                )
+                for row_latents in latents:
+                    frames = row_latents.reshape(1, -1, row_latents.size(-1))
+                    waveform = _offline_decode_generated_latents(processor, model, [frames])
+                    results.append(
+                        GenerationResult(
+                            waveform=waveform.detach().cpu(), sample_rate=self.runtime.sample_rate
+                        )
+                    )
+                continue
+
+            pieces: list[list[torch.Tensor]] = [[] for _ in rows]
+
+            def on_patch(step, latent, active, decoder=None, rows=rows, pieces=pieces):
+                with _vae_decode_autocast(processor, processor.device):
+                    waveforms = decoder.decode_chunk(latent.to(processor.device))
+                waveforms = _normalize_decoded_waveforms(waveforms).detach().float().cpu()
+                for row, index in enumerate(rows):
+                    if bool(active[row]):
+                        chunk = waveforms[row : row + 1].contiguous()
+                        pieces[row].append(chunk)
+                        pcm_chunk_callback(index, chunk)
+
+            with processor.acoustic_vae.streaming_decode() as decoder:
+                batched_ar_infer(
+                    infer_config,
+                    model,
+                    [b[0] for b in branches],
+                    [b[2] for b in branches] if plan.uses_lm_cfg else None,
+                    speaker_embedding=dit_speaker_for_plan(plan, speaker),
+                    on_patch=lambda step, latent, active: on_patch(step, latent, active, decoder=decoder),
+                )
+            for row_pieces in pieces:
                 results.append(
-                    GenerationResult(waveform=waveform.detach().cpu(), sample_rate=self.runtime.sample_rate)
+                    GenerationResult(
+                        waveform=torch.cat(row_pieces, dim=-1), sample_rate=self.runtime.sample_rate
+                    )
                 )
         return results
+
+    def generate_batch_stream(self, texts: list[str], **kwargs) -> Iterator[tuple[int, AudioChunk]]:
+        """Yield (index, AudioChunk) as each text's audio is decoded, `index`
+        being its position in `texts`; chunks of different texts interleave.
+        Takes generate_batch's arguments. Generation runs in a worker thread;
+        closing the iterator stops it at the next decoded patch. Use only one
+        active generation per CuteTTS instance."""
+        messages: queue.SimpleQueue = queue.SimpleQueue()
+        cancelled = threading.Event()
+
+        def emit(index: int, chunk: torch.Tensor) -> None:
+            if cancelled.is_set():
+                raise _StreamCancelled()
+            messages.put((index, AudioChunk(waveform=chunk, sample_rate=self.runtime.sample_rate)))
+
+        def run() -> None:
+            try:
+                self.generate_batch(texts, pcm_chunk_callback=emit, **kwargs)
+            except _StreamCancelled:
+                pass
+            except BaseException as error:
+                messages.put(_StreamFailure(error))
+            finally:
+                messages.put(_STREAM_DONE)
+
+        worker = threading.Thread(target=run, name="cutetts-batch-stream", daemon=True)
+        worker.start()
+        try:
+            while True:
+                message = messages.get()
+                if message is _STREAM_DONE:
+                    break
+                if isinstance(message, _StreamFailure):
+                    raise message.error
+                yield message
+        finally:
+            cancelled.set()
+            worker.join()
+
+    @torch.inference_mode()
+    def create_voice_prompt(self, reference_audio: str | Path) -> VoicePrompt:
+        """Encode a reference recording once; pass the result as
+        `reference_audio` to any generate method to skip re-encoding it."""
+        processor = self.runtime.processor
+        reference_wave, speaker_wave = prepare_reference_audio(
+            reference_audio,
+            self.runtime.sample_rate,
+            int(self.runtime.speaker_encoder.sample_rate),
+        )
+        speaker_device = next(self.runtime.speaker_encoder.parameters()).device
+        cuda_devices = {
+            device.index if device.index is not None else torch.cuda.current_device()
+            for device in (processor.device, speaker_device)
+            if device.type == "cuda"
+        }
+        # The VAE posterior draws an (unused) random std; keep that off the
+        # generation RNG so a precomputed prompt and a path give the same audio.
+        with torch.random.fork_rng(devices=sorted(cuda_devices)), torch.autocast(
+            device_type=self.runtime.model.device.type, enabled=False
+        ):
+            [[reference_features]] = processor.acoustic_batch_extractor(
+                [[reference_wave.to(processor.device)]],
+                processor.acoustic_feature_forward,
+            )
+            speaker_output = self.runtime.speaker_encoder(
+                speaker_wave.to(speaker_device),
+                int(self.runtime.speaker_encoder.sample_rate),
+            )
+        return VoicePrompt(reference_features, speaker_output["embedding"].float())
 
     def _settings(
         self,
         mode: str,
-        reference_audio: str | Path | None,
+        reference_audio: str | Path | VoicePrompt | None,
         dialect: str | None,
         cfg_strength: float,
         diffusion_steps: int | None,
@@ -342,7 +488,7 @@ class CuteTTS:
         self,
         text: str,
         mode: str,
-        reference_audio: str | Path | None,
+        reference_audio: str | Path | VoicePrompt | None,
         dialect: str | None,
         plan,
     ):
@@ -353,22 +499,13 @@ class CuteTTS:
         reference_features = None
         speaker_embedding = None
         if mode == "voice_clone":
-            reference_wave, speaker_wave = prepare_reference_audio(
-                reference_audio,
-                self.runtime.sample_rate,
-                int(self.runtime.speaker_encoder.sample_rate),
+            prompt = (
+                reference_audio
+                if isinstance(reference_audio, VoicePrompt)
+                else self.create_voice_prompt(reference_audio)
             )
-            speaker_device = next(self.runtime.speaker_encoder.parameters()).device
-            with torch.autocast(device_type=model.device.type, enabled=False):
-                [[reference_features]] = processor.acoustic_batch_extractor(
-                    [[reference_wave.to(processor.device)]],
-                    processor.acoustic_feature_forward,
-                )
-                speaker_output = self.runtime.speaker_encoder(
-                    speaker_wave.to(speaker_device),
-                    int(self.runtime.speaker_encoder.sample_rate),
-                )
-            speaker_embedding = speaker_output["embedding"].float()
+            reference_features = prompt.reference_features.to(processor.device)
+            speaker_embedding = prompt.speaker_embedding.to(model.device)
 
         cond_prefix = build_prefix_segment(
             processor,
@@ -410,7 +547,7 @@ class CuteTTS:
         text: str,
         *,
         mode: str = "tts",
-        reference_audio: str | Path | None = None,
+        reference_audio: str | Path | VoicePrompt | None = None,
         dialect: str | None = None,
         cfg_strength: float = 2.0,
         diffusion_steps: int | None = None,

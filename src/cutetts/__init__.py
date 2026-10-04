@@ -14,7 +14,7 @@
 
 """CuteTTS inference package."""
 
-from cutetts.api import AudioChunk, CuteTTS, GenerationResult
+from cutetts.api import AudioChunk, CuteTTS, GenerationResult, VoicePrompt
 
-__all__ = ["AudioChunk", "CuteTTS", "GenerationResult"]
+__all__ = ["AudioChunk", "CuteTTS", "GenerationResult", "VoicePrompt"]
 __version__ = "0.1.0"

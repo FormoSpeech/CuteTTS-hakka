@@ -47,6 +47,19 @@ results = model.generate_batch(
 )
 ```
 
+`generate_batch_stream` takes the same arguments and yields `(index, AudioChunk)` as each text's audio is decoded.
+
+When the same voices are used over and over, encode each reference once with `create_voice_prompt` and pass the result as `reference_audio` to any generate method. This skips reading the file and running the VAE and speaker encoders on every request, and gives the same audio as passing the path. A `VoicePrompt` can be saved and reloaded:
+
+```python
+from cutetts import VoicePrompt
+
+voice = model.create_voice_prompt("ref.wav")
+voice.save("voice.safetensors")
+voice = VoicePrompt.load("voice.safetensors")
+result = model.generate("客語語音合成測試。", mode="voice_clone", reference_audio=voice, dialect="客語四縣腔")
+```
+
 `CuteTTS.from_pretrained(..., compile_lm=True)` CUDA-graphs the language model's per-patch decode step, which makes single-utterance `generate` faster. The first call then pays a one-time compilation, so it suits long-running processes.
 
 A model's `config.json` can set `generation_defaults` (e.g. `{"diffusion_sway_coefficient": 0.0}`). The Hakka base checkpoint uses it to default to uniform steps: on the Hakka eval they match sway sampling in quality, and the compiled sampler makes them about 2x faster.
